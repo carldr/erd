@@ -95,30 +95,62 @@ module Erd
       else
         Rails.application.eager_load!
       end
+
       ar_descendants = ActiveRecord::Base.descendants.reject {|m| m.name.in?(%w(ActiveRecord::SchemaMigration ActiveRecord::InternalMetadata ApplicationRecord)) }
-      ar_descendants.reject! {|m| !m.table_exists? }
+      ar_descendants.reject! {|m| !m.table_exists? || m.abstract_class? }
+
+      ar_nodes = ar_descendants.map do |model|
+        [ 
+          model.name,
+          {
+            superclass: model.superclass.name,
+            columns: model.columns.reject {|c| c.name.in? %w(id created_at updated_at) }.map {|c| [c.name, c.type] },
+            associations: model.reflect_on_all_associations
+          }
+        ]
+      end.to_h
 
       g = GraphViz.new('ERD', :type => :digraph, :rankdir => 'LR', :labelloc => :t, :ranksep => '1.5', :nodesep => '1.8', :margin => '0,0', :splines => 'spline') {|g|
-        nodes = ar_descendants.each_with_object({}) do |model, hash|
-          next if model.name.start_with? 'HABTM_'
-          hash[model.name] = model.columns.reject {|c| c.name.in? %w(id created_at updated_at) }.map {|c| [c.name, c.type]}
-        end
+        nodes = ar_nodes.map do |name, details|
+          next if name.start_with? 'HABTM_'
+          [ name, details ]
+        end.to_h
 
-        edges = []
-        ar_descendants.each do |model|
-          model.reflect_on_all_associations.each do |reflection|
-            next unless nodes.key? model.name
-            next if reflection.macro == :belongs_to
-            next unless nodes.key?(reflection.klass.name)
+        replacement_mapping = {}
 
-            edges << [model.name, reflection.klass.name]
-            # don't include the FKs in the diagram
-            nodes[reflection.klass.name].delete_if {|col, _type| col == reflection.foreign_key }
+        #  If the superclass is in the diagram, remove the subclass, and add the subclasses associations to the superclass
+        ar_nodes.each do |name, details|
+          if nodes.keys.include? details[ :superclass ]
+            ar_nodes[ details[ :superclass ] ][ :associations ] << details[ :associations ]
+            ar_nodes[ details[ :superclass ] ][ :associations ].flatten!
+            ar_nodes[ details[ :superclass ] ][ :associations ].uniq!
+
+            replacement_mapping[ name ] = details[ :superclass ]
+
+            nodes.delete name
+          else 
+            replacement_mapping[ name ] = name
+
           end
         end
 
-        nodes.each_pair do |model_name, cols|
-          g.add_nodes model_name, 'shape' => 'record', 'label' => "#{model_name}|#{cols.map {|name, type| "#{name}(#{type})"}.join('\l')}"
+        edges = []
+        ar_nodes.each do |name, details|
+          details[ :associations ].each do |reflection|
+            logger.error reflection.inspect.green
+
+            next unless nodes.key? name
+            # next if reflection.macro == :belongs_to
+            next unless nodes.key?(replacement_mapping[reflection.klass.name])
+
+            edges << [name, replacement_mapping[reflection.klass.name]]
+            # don't include the FKs in the diagram
+            nodes[replacement_mapping[reflection.klass.name]].delete_if {|col, _type| col == reflection.foreign_key }
+          end
+        end
+
+        nodes.each_pair do |model_name, model|
+          g.add_nodes model_name, 'shape' => 'record', 'label' => "#{model_name}|#{model[ :columns ].map {|name, type| "#{name}(#{type})"}.join('\l')}"
         end
         edges.each do |from, to|
           g.add_edge g.search_node(from), g.search_node(to)
